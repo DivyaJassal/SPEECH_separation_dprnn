@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+
+# Dataset
+conversational_dataset_v2/
+
+# Model checkpoints
+checkpoints/
+*.pt
+*.pth
+
+# Outputs
+outputs/
+runs/
+
+# macOS
+.DS_Store
+
+# VS Code
+.vscode/
