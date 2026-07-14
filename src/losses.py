@@ -1,18 +1,4 @@
-"""
-SI-SDR (scale-invariant SDR) loss + Permutation Invariant Training (PIT).
 
-Why SI-SDR: it's invariant to a global scale factor between prediction and
-target, so the model isn't penalized for getting the volume slightly wrong —
-only the actual waveform shape/timing/separation quality matters. This is
-the de-facto standard loss/metric for source separation research
-(WSJ0-mix, LibriMix, DNS challenge, etc).
-
-Why PIT: see README section 1. Ground truth speaker order is arbitrary, so
-we score every output-target permutation and train on whichever pairing was
-best. For C <= ~5 speakers, brute-force over all permutations is cheap. For
-larger C, we use the Hungarian algorithm (scipy) instead of factorial
-brute force.
-"""
 import itertools
 import torch
 import numpy as np

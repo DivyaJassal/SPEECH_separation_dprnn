@@ -67,7 +67,7 @@ class SpeechSeparationDataset(Dataset):
             sample_dir / "mixture.flac"
         )
 
-        # Optional: ensure sample rate is correct
+
         if sr != self.sample_rate:
             raise ValueError(
                 f"Expected sample rate {self.sample_rate}, but got {sr}"
@@ -83,7 +83,7 @@ class SpeechSeparationDataset(Dataset):
             audio, _ = torchaudio.load(file)
             source_list.append(audio)
 
-        # Pad with silent sources until max_sources
+        
         while len(source_list) < self.max_sources:
             source_list.append(
                 torch.zeros_like(mixture)

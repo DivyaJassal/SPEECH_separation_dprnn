@@ -1,11 +1,11 @@
 import torch
 import torch.nn as nn
+
 import torch.nn.functional as F
 
 
 class GlobalLayerNorm(nn.Module):
-    """Global Layer Norm over both channel and time dims (gLN) — used
-    because this is the non-causal (offline) version of Conv-TasNet."""
+
 
     def __init__(self, channels, eps=1e-8):
         super().__init__()
@@ -74,14 +74,14 @@ class TemporalConvNet(nn.Module):
 class ConvTasNet(nn.Module):
     def __init__(
         self,
-        num_sources=4,             # = config["max_sources"]
-        enc_filters=512,           # N
-        enc_kernel_size=32,        # L (32 samples @16kHz ~ 2ms; use 16 @8kHz)
-        bottleneck_channels=128,   # B
-        hidden_channels=512,       # H
-        kernel_size=3,             # P
-        num_blocks=8,              # X
-        num_repeats=3,             # R
+        num_sources=4,             
+        enc_filters=512,           
+        enc_kernel_size=32,        
+        bottleneck_channels=128,   
+        hidden_channels=512,       
+        kernel_size=3,             
+        num_blocks=8,              
+        num_repeats=3,             
         mask_activation="sigmoid",
     ):
         super().__init__()
@@ -112,18 +112,14 @@ class ConvTasNet(nn.Module):
             stride=self.enc_stride, bias=False,
         )
 
-    def forward(self, mixture):
-        """
-        mixture: (B, T) or (B, 1, T) raw waveform (this project's dataset
-                 yields (1, T) per-sample via torchaudio.load, so DataLoader
-                 batches arrive as (B, 1, T) — both shapes are accepted).
-        returns: (B, num_sources, T) separated waveforms.
-        """
-        if mixture.dim() == 3:
-            mixture = mixture.squeeze(1)  # (B, 1, T) -> (B, T)
-        mixture = mixture.unsqueeze(1)  # -> (B, 1, T) for the conv encoder
 
-        enc_out = self.encoder(mixture)  # (B, N, T')
+    def forward(self, mixture):
+
+        if mixture.dim() == 3:
+            mixture = mixture.squeeze(1) 
+        mixture = mixture.unsqueeze(1)  
+
+        enc_out = self.encoder(mixture)  
         T_enc = enc_out.shape[-1]
 
         y = self.layer_norm(enc_out)
@@ -164,7 +160,7 @@ if __name__ == "__main__":
     model = ConvTasNet(num_sources=4)
     model.eval()
     with torch.no_grad():
-        x = torch.randn(2, 1, 16000 * 4)  # matches this project's (B,1,T) convention
+        x = torch.randn(2, 1, 16000 * 4)  
         out = model(x)
     print("input:", x.shape, "-> output:", out.shape)
     assert out.shape == (2, 4, 16000 * 4)
