@@ -10,3 +10,4 @@ matplotlib
 tensorboard
 pyyaml
 torchcodec
+scikit-learn

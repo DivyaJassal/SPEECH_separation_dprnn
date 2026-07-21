@@ -1,130 +1,138 @@
-
 import itertools
 import torch
-import numpy as np
-from scipy.optimize import linear_sum_assignment
+import torch.nn.functional as F
 
 
 def si_sdr(estimate, target, eps=1e-8):
-    """
-    estimate, target: (..., T) waveforms.
-    Returns SI-SDR in dB, same leading shape as input minus the time dim.
-    """
-    target = target - target.mean(dim=-1, keepdim=True)
-    estimate = estimate - estimate.mean(dim=-1, keepdim=True)
+    estimate = estimate - torch.mean(estimate, dim=-1, keepdim=True)
+    target = target - torch.mean(target, dim=-1, keepdim=True)
 
-    # projection of estimate onto target (the "signal" part)
-    dot = (estimate * target).sum(dim=-1, keepdim=True)
-    target_energy = (target ** 2).sum(dim=-1, keepdim=True) + eps
-    proj = dot * target / target_energy
+    projection = (
+        torch.sum(
+            estimate * target,
+            dim=-1,
+            keepdim=True
+        )
+        /
+        (
+            torch.sum(
+                target ** 2,
+                dim=-1,
+                keepdim=True
+            )
+            + eps
+        )
+    ) * target
 
-    noise = estimate - proj
+    noise = estimate - projection
 
-    ratio = (proj ** 2).sum(dim=-1) / ((noise ** 2).sum(dim=-1) + eps)
-    return 10 * torch.log10(ratio + eps)
+    ratio = (
+        torch.sum(
+            projection ** 2,
+            dim=-1
+        )
+        /
+        (
+            torch.sum(
+                noise ** 2,
+                dim=-1
+            )
+            + eps
+        )
+    )
+
+    return 10 * torch.log10(
+        ratio + eps
+    )
 
 
-def _all_permutations(c):
-    return list(itertools.permutations(range(c)))
+def pairwise_si_sdr(estimates, targets):
+    num_sources = estimates.shape[1]
+
+    scores = torch.zeros(
+        estimates.shape[0],
+        num_sources,
+        num_sources,
+        device=estimates.device
+    )
+
+    for i in range(num_sources):
+        for j in range(num_sources):
+            scores[:, i, j] = si_sdr(
+                estimates[:, i],
+                targets[:, j]
+            )
+
+    return scores
 
 
-def pit_si_sdr_loss(estimates, targets, max_brute_force=5):
-    """
-    estimates: (B, C, T) model outputs
-    targets:   (B, C, T) ground truth sources (same, arbitrary, order)
+def pit_si_sdr_loss(estimates, targets):
+    batch_size = estimates.shape[0]
+    num_sources = estimates.shape[1]
 
-    Returns:
-        loss: scalar tensor to backprop (negative mean best SI-SDR)
-        best_si_sdr: (B,) best SI-SDR per example, for logging (positive dB)
-        best_perm: (B, C) the winning permutation indices, for inspection
-    """
-    B, C, T = estimates.shape
-    device = estimates.device
+    scores = pairwise_si_sdr(
+        estimates,
+        targets
+    )
 
-    if C <= max_brute_force:
-        perms = _all_permutations(C)
-        # pairwise SI-SDR matrix: (B, C_est, C_tgt)
-        pairwise = torch.zeros(B, C, C, device=device)
-        for i in range(C):
-            for j in range(C):
-                pairwise[:, i, j] = si_sdr(estimates[:, i], targets[:, j])
+    perms = list(
+        itertools.permutations(
+            range(num_sources)
+        )
+    )
 
-        best_scores = torch.full((B,), -1e9, device=device)
-        best_perm = torch.zeros(B, C, dtype=torch.long, device=device)
+    best_scores = []
+
+    for b in range(batch_size):
+        perm_scores = []
+
         for perm in perms:
-            score = sum(pairwise[:, i, p] for i, p in enumerate(perm)) / C
-            improve = score > best_scores
-            best_scores = torch.where(improve, score, best_scores)
-            perm_t = torch.tensor(perm, device=device)
-            best_perm[improve] = perm_t
-        return -best_scores.mean(), best_scores.detach(), best_perm
+            score = 0
 
-    else:
-        # Hungarian algorithm per-example — scales to large C where
-        # brute-force permutations (C!) would be infeasible.
-        pairwise = torch.zeros(B, C, C, device=device)
-        for i in range(C):
-            for j in range(C):
-                pairwise[:, i, j] = si_sdr(estimates[:, i], targets[:, j])
+            for i in range(num_sources):
+                score += scores[
+                    b,
+                    i,
+                    perm[i]
+                ]
 
-        best_scores = torch.zeros(B, device=device)
-        best_perm = torch.zeros(B, C, dtype=torch.long, device=device)
-        cost = (-pairwise).detach().cpu().numpy()  # minimize cost = maximize SI-SDR
-        for b in range(B):
-            row_ind, col_ind = linear_sum_assignment(cost[b])
-            best_perm[b] = torch.tensor(col_ind, device=device)
-            best_scores[b] = pairwise[b, row_ind, col_ind].mean()
-        return -best_scores.mean(), best_scores.detach(), best_perm
+            perm_scores.append(score)
 
-def pit_si_sdr_loss_variable(estimates, targets, active_counts, silence_weight=0.1):
-    """
-    This project's dataset always returns exactly `max_sources` channels,
-    zero-padding when a mixture has fewer real speakers. Plugging that
-    straight into pit_si_sdr_loss would compute SI-SDR against all-zero
-    "silence" targets, which is mathematically undefined (zero target
-    energy) and gives no useful gradient telling the model to actually
-    output silence there.
+        best_scores.append(
+            torch.max(
+                torch.stack(
+                    perm_scores
+                )
+            )
+        )
 
-    This version matches only the REAL speakers (targets[:active_count])
-    against the best-fitting subset of the model's output channels
-    (Hungarian algorithm), and separately pushes the leftover, unmatched
-    output channels toward silence with a simple energy penalty.
+    best_scores = torch.stack(
+        best_scores
+    )
 
-    estimates:      (B, C, T) — C = max_sources, model's fixed output count
-    targets:        (B, C, T) — first active_counts[b] channels are real
-                    speakers, remaining channels are zero-padding
-    active_counts:  (B,) — real speaker count per example (this project's
-                    dataset returns this as sample["num_sources"])
-    """
-    B, C, T = estimates.shape
-    device = estimates.device
+    loss = -torch.mean(
+        best_scores
+    )
 
-    total_loss = 0.0
-    active_sisdr = torch.zeros(B, device=device)
+    return loss
 
-    for b in range(B):
-        c_active = int(active_counts[b].item())
-        active_targets = targets[b, :c_active]  # (c_active, T)
 
-        pairwise = torch.zeros(C, c_active, device=device)
-        for i in range(C):
-            for j in range(c_active):
-                pairwise[i, j] = si_sdr(estimates[b, i], active_targets[j])
+def si_sdr_improvement(
+    estimate,
+    mixture,
+    target
+):
+    estimate_score = si_sdr(
+        estimate,
+        target
+    )
 
-        cost = (-pairwise).detach().cpu().numpy()
-        row_ind, col_ind = linear_sum_assignment(cost)  # len = min(C, c_active)
+    mixture_score = si_sdr(
+        mixture,
+        target
+    )
 
-        matched_score = pairwise[row_ind, col_ind].mean()
-
-        matched_estimate_idx = set(row_ind.tolist())
-        unmatched_idx = [i for i in range(C) if i not in matched_estimate_idx]
-        if unmatched_idx:
-            unmatched_est = estimates[b, unmatched_idx]
-            silence_loss = (unmatched_est ** 2).mean()
-        else:
-            silence_loss = torch.tensor(0.0, device=device)
-
-        total_loss = total_loss + (-matched_score + silence_weight * silence_loss)
-        active_sisdr[b] = matched_score.detach()
-
-    return total_loss / B, active_sisdr
+    return (
+        estimate_score -
+        mixture_score
+    )

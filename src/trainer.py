@@ -1,327 +1,186 @@
-from pathlib import Path
-import csv
-
+import os
 import torch
 from tqdm import tqdm
 
-from config import load_config
-from dataloader import create_dataloader
-from conv_tasnet import ConvTasNet
-from losses import pit_si_sdr_loss_variable
-from utils import (
-    set_seed,
-    count_parameters,
-    save_checkpoint,
-    load_checkpoint,
-    get_device,
-    AverageMeter,
-)
+from losses import pit_si_sdr_loss
 
 
-def run_epoch(model, loader, optimizer, device, cfg, train=True):
-    """
-    Runs one training or validation epoch.
-    """
+class Trainer:
+    def __init__(
+        self,
+        model,
+        train_loader,
+        val_loader,
+        optimizer,
+        device,
+        config
+    ):
+        self.model = model.to(device)
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.optimizer = optimizer
+        self.device = device
+        self.config = config
 
-    if train:
-        model.train()
-    else:
-        model.eval()
+        self.best_loss = float("inf")
 
-    loss_meter = AverageMeter()
-    sisdr_meter = AverageMeter()
+        self.checkpoint_dir = config.get(
+            "checkpoint_dir",
+            "checkpoints"
+        )
 
-    with torch.set_grad_enabled(train):
+        os.makedirs(
+            self.checkpoint_dir,
+            exist_ok=True
+        )
 
-        for batch in tqdm(
-            loader,
-            desc="train" if train else "val",
-            leave=False,
-        ):
+    def train_epoch(self):
 
-            mixture = batch["mixture"].to(device)
-            sources = batch["sources"].to(device)
-            num_sources = batch["num_sources"].to(device)
+        self.model.train()
 
-            estimates = model(mixture)
+        total_loss = 0
 
-            loss, best_sisdr = pit_si_sdr_loss_variable(
-                estimates,
-                sources,
-                num_sources,
-                silence_weight=cfg["silence_weight"],
+        loop = tqdm(
+            self.train_loader,
+            desc="Training"
+        )
+
+        for batch in loop:
+
+            mixture = batch["mixture"].to(self.device)
+            sources = batch["sources"].to(self.device)
+
+            self.optimizer.zero_grad()
+
+            estimates = self.model(
+                mixture
             )
 
-            if train:
+            loss = pit_si_sdr_loss(
+                estimates,
+                sources
+            )
 
-                optimizer.zero_grad()
+            loss.backward()
 
-                loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                5.0
+            )
 
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(),
-                    cfg["grad_clip_norm"],
+            self.optimizer.step()
+
+            total_loss += loss.item()
+
+            loop.set_postfix(
+                loss=f"{loss.item():.4f}"
+            )
+
+        return total_loss / len(self.train_loader)
+
+    def validate(self):
+
+        self.model.eval()
+
+        total_loss = 0
+
+        with torch.no_grad():
+
+            loop = tqdm(
+                self.val_loader,
+                desc="Validation"
+            )
+
+            for batch in loop:
+
+                mixture = batch["mixture"].to(self.device)
+                sources = batch["sources"].to(self.device)
+
+                estimates = self.model(
+                    mixture
                 )
 
-                optimizer.step()
+                loss = pit_si_sdr_loss(
+                    estimates,
+                    sources
+                )
 
-            batch_size = mixture.size(0)
+                total_loss += loss.item()
 
-            loss_meter.update(loss.item(), batch_size)
+                loop.set_postfix(
+                    loss=f"{loss.item():.4f}"
+                )
 
-            sisdr_meter.update(
-                best_sisdr.mean().item(),
-                batch_size,
+        return total_loss / len(self.val_loader)
+
+    def fit(self, epochs):
+
+        for epoch in range(epochs):
+
+            print(f"\n========== Epoch {epoch + 1}/{epochs} ==========")
+
+            # -------------------
+            # Training
+            # -------------------
+            train_loss = self.train_epoch()
+
+            # -------------------
+            # Save latest checkpoint
+            # -------------------
+            last_path = os.path.join(
+                self.checkpoint_dir,
+                "last_dprnn.pt"
             )
 
-    return loss_meter.avg, sisdr_meter.avg
-
-
-def main():
-
-    cfg = load_config()
-
-    set_seed(cfg["seed"])
-
-    device = get_device()
-
-    print("=" * 70)
-    print(f"Using device : {device}")
-    print("=" * 70)
-
-    train_loader = create_dataloader(
-        root_dir=cfg["data_root"],
-        split="train",
-        sample_rate=cfg["sample_rate"],
-        segment_seconds=cfg["segment_seconds"],
-        max_sources=cfg["max_sources"],
-        batch_size=cfg["train_batch_size"],
-        shuffle=cfg["shuffle"],
-        num_workers=cfg["num_workers"],
-    )
-
-    val_loader = create_dataloader(
-        root_dir=cfg["data_root"],
-        split="val",
-        sample_rate=cfg["sample_rate"],
-        segment_seconds=cfg["segment_seconds"],
-        max_sources=cfg["max_sources"],
-        batch_size=cfg["val_batch_size"],
-        shuffle=False,
-        num_workers=cfg["num_workers"],
-    )
-
-    model = ConvTasNet(
-        num_sources=cfg["max_sources"],
-        enc_filters=cfg["enc_filters"],
-        enc_kernel_size=cfg["enc_kernel_size"],
-        bottleneck_channels=cfg["bottleneck_channels"],
-        hidden_channels=cfg["hidden_channels"],
-        kernel_size=cfg["tcn_kernel_size"],
-        num_blocks=cfg["num_blocks"],
-        num_repeats=cfg["num_repeats"],
-    ).to(device)
-
-    print(
-        f"Model Parameters : {count_parameters(model):,}"
-    )
-
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=cfg["lr"],
-    )
-
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="max",
-        factor=0.5,
-        patience=3,
-    )
-
-    ckpt_dir = Path(cfg["checkpoint_dir"])
-
-    ckpt_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    last_ckpt = ckpt_dir / "last.pt"
-
-    start_epoch = 1
-
-    best_val_sisdr = -1e9
-
-    if last_ckpt.exists():
-
-        print("\nFound existing checkpoint.")
-
-        ckpt = load_checkpoint(
-            last_ckpt,
-            model,
-            optimizer,
-            device=device,
-        )
-
-        start_epoch = ckpt["epoch"] + 1
-
-        best_val_sisdr = ckpt["best_val_sisdr"]
-
-        print(
-            f"Resuming from Epoch {start_epoch}"
-        )
-
-        print(
-            f"Best Validation SI-SDR : "
-            f"{best_val_sisdr:.2f} dB"
-        )
-
-    else:
-
-        print("\nNo checkpoint found.")
-
-        print("Starting fresh training.")
-
-    runs_dir = Path("../runs")
-
-    runs_dir.mkdir(
-        exist_ok=True,
-    )
-
-    log_file = runs_dir / "train_log.csv"
-
-    if not log_file.exists():
-
-        with open(log_file, "w", newline="") as f:
-
-            writer = csv.writer(f)
-
-            writer.writerow(
-                [
-                    "epoch",
-                    "train_loss",
-                    "val_loss",
-                    "train_sisdr",
-                    "val_sisdr",
-                    "learning_rate",
-                ]
+            torch.save(
+                {
+                    "epoch": epoch + 1,
+                    "model_state_dict": self.model.state_dict(),
+                    "optimizer_state_dict": self.optimizer.state_dict(),
+                    "train_loss": train_loss,
+                },
+                last_path
             )
 
-    patience = 8
+            print(f"Latest checkpoint saved -> {last_path}")
 
-    patience_counter = 0
-    model = ConvTasNet(
-        num_sources=cfg["max_sources"],
-        enc_filters=cfg["enc_filters"],
-        enc_kernel_size=cfg["enc_kernel_size"],
-        bottleneck_channels=cfg["bottleneck_channels"],
-        hidden_channels=cfg["hidden_channels"],
-        kernel_size=cfg["tcn_kernel_size"],
-        num_blocks=cfg["num_blocks"],
-        num_repeats=cfg["num_repeats"],
-    ).to(device)
+            # -------------------
+            # Validation
+            # -------------------
+            try:
 
-    print(f"Model parameters: {count_parameters(model):,}")
+                val_loss = self.validate()
 
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=cfg["lr"]
-    )
+                print(f"Train Loss : {train_loss:.4f}")
+                print(f"Val Loss   : {val_loss:.4f}")
 
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="max",
-        factor=0.5,
-        patience=3
-    )
+                if val_loss < self.best_loss:
 
-    ckpt_dir = Path(cfg["checkpoint_dir"])
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
+                    self.best_loss = val_loss
 
-    # ----------------------------------------------------
-    # Resume training automatically if last.pt exists
-    # ----------------------------------------------------
-    start_epoch = 1
-    best_val_sisdr = -1e9
+                    best_path = os.path.join(
+                        self.checkpoint_dir,
+                        "best_dprnn.pt"
+                    )
 
-    last_ckpt = ckpt_dir / "last.pt"
+                    torch.save(
+                        {
+                            "epoch": epoch + 1,
+                            "model_state_dict": self.model.state_dict(),
+                            "optimizer_state_dict": self.optimizer.state_dict(),
+                            "train_loss": train_loss,
+                            "val_loss": val_loss,
+                        },
+                        best_path
+                    )
 
-    if last_ckpt.exists():
+                    print(f"Best model saved -> {best_path}")
 
-        print(f"Resuming from {last_ckpt}")
+            except Exception as e:
 
-        checkpoint = load_checkpoint(
-            last_ckpt,
-            model,
-            optimizer,
-            device
-        )
+                print("\nValidation failed!")
+                print(e)
+                print("Training checkpoint has already been saved.")
+                break
 
-        start_epoch = checkpoint["epoch"] + 1
-        best_val_sisdr = checkpoint["best_val_sisdr"]
-
-        print(f"Continuing from epoch {start_epoch}")
-
-    else:
-
-        print("Starting fresh training")
-
-    # ----------------------------------------------------
-    # Training Loop
-    # ----------------------------------------------------
-    for epoch in range(start_epoch, cfg["epochs"] + 1):
-
-        train_loss, train_sisdr = run_epoch(
-            model,
-            train_loader,
-            optimizer,
-            device,
-            cfg,
-            train=True
-        )
-
-        val_loss, val_sisdr = run_epoch(
-            model,
-            val_loader,
-            optimizer,
-            device,
-            cfg,
-            train=False
-        )
-
-        scheduler.step(val_sisdr)
-
-        print(
-            f"Epoch {epoch:03d} | "
-            f"Train SI-SDR: {train_sisdr:.2f} dB | "
-            f"Val SI-SDR: {val_sisdr:.2f} dB | "
-            f"LR: {optimizer.param_groups[0]['lr']:.2e}"
-        )
-
-        save_checkpoint(
-            ckpt_dir / "last.pt",
-            model,
-            optimizer,
-            epoch,
-            best_val_sisdr,
-            extra={"config": cfg}
-        )
-
-        if val_sisdr > best_val_sisdr:
-
-            best_val_sisdr = val_sisdr
-
-            save_checkpoint(
-                ckpt_dir / "best.pt",
-                model,
-                optimizer,
-                epoch,
-                best_val_sisdr,
-                extra={"config": cfg}
-            )
-
-            print(
-                f"New Best Model Saved "
-                f"(Val SI-SDR = {val_sisdr:.2f} dB)"
-            )
-if __name__ == "__main__":
-    main()
+        print("\nTraining Finished.")
